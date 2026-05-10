@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <array>
+#include <chrono>
 #include <iostream>
 #include <vector>
 
@@ -588,15 +589,23 @@ int main(int argc, char** argv) {
     rs_recovered++;
   }
 
+  const auto e2e_start = std::chrono::high_resolution_clock::now();
   VerifyInstance* d = nullptr;
   cgbn_error_report_t* report = nullptr;
   check_cuda(cudaMalloc(&d, sizeof(VerifyInstance) * N), "cudaMalloc(inst)");
-  check_cuda(cudaMemcpy(d, h.data(), sizeof(VerifyInstance) * N, cudaMemcpyHostToDevice), "cudaMemcpy H2D");
   check_cuda(cgbn_error_report_alloc(&report), "cgbn_error_report_alloc");
 
-  cudaEvent_t s, e;
+  cudaEvent_t s, e, h2d_s, h2d_e, d2h_s, d2h_e;
   check_cuda(cudaEventCreate(&s), "cudaEventCreate(s)");
   check_cuda(cudaEventCreate(&e), "cudaEventCreate(e)");
+  check_cuda(cudaEventCreate(&h2d_s), "cudaEventCreate(h2d_s)");
+  check_cuda(cudaEventCreate(&h2d_e), "cudaEventCreate(h2d_e)");
+  check_cuda(cudaEventCreate(&d2h_s), "cudaEventCreate(d2h_s)");
+  check_cuda(cudaEventCreate(&d2h_e), "cudaEventCreate(d2h_e)");
+
+  check_cuda(cudaEventRecord(h2d_s), "cudaEventRecord(h2d_s)");
+  check_cuda(cudaMemcpy(d, h.data(), sizeof(VerifyInstance) * N, cudaMemcpyHostToDevice), "cudaMemcpy H2D");
+  check_cuda(cudaEventRecord(h2d_e), "cudaEventRecord(h2d_e)");
 
   const int blocks = (N * TPI + TPB - 1) / TPB;
   // Warmup.
@@ -617,10 +626,17 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  float kernel_ms = 0.0f;
+  float kernel_ms = 0.0f, h2d_ms = 0.0f, d2h_ms = 0.0f;
   check_cuda(cudaEventElapsedTime(&kernel_ms, s, e), "cudaEventElapsedTime");
+  check_cuda(cudaEventElapsedTime(&h2d_ms, h2d_s, h2d_e), "cudaEventElapsedTime h2d");
 
+  check_cuda(cudaEventRecord(d2h_s), "cudaEventRecord(d2h_s)");
   check_cuda(cudaMemcpy(h.data(), d, sizeof(VerifyInstance) * N, cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
+  check_cuda(cudaEventRecord(d2h_e), "cudaEventRecord(d2h_e)");
+  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize post D2H");
+  check_cuda(cudaEventElapsedTime(&d2h_ms, d2h_s, d2h_e), "cudaEventElapsedTime d2h");
+  const auto e2e_end = std::chrono::high_resolution_clock::now();
+  const double e2e_ms = std::chrono::duration<double, std::milli>(e2e_end - e2e_start).count();
 
   int mismatches = 0;
   int valid = 0;
@@ -636,12 +652,19 @@ int main(int argc, char** argv) {
   const double avg_ms = static_cast<double>(kernel_ms) / static_cast<double>(repeats);
   std::cout << "Kernel total time over " << repeats << " runs (ms): " << kernel_ms << '\n';
   std::cout << "Kernel avg time (ms): " << avg_ms << '\n';
+  std::cout << "GPU H2D time (ms): " << h2d_ms << '\n';
+  std::cout << "GPU D2H time (ms): " << d2h_ms << '\n';
+  std::cout << "GPU end-to-end time (ms): " << e2e_ms << '\n';
   std::cout << "Throughput (verifies/s): " << ((static_cast<double>(N) * 1000.0) / avg_ms) << '\n';
   std::cout << "Valid: " << valid << ", Invalid: " << (N - valid) << '\n';
   std::cout << "Mismatches vs expected: " << mismatches << '\n';
 
   cudaEventDestroy(s);
   cudaEventDestroy(e);
+  cudaEventDestroy(h2d_s);
+  cudaEventDestroy(h2d_e);
+  cudaEventDestroy(d2h_s);
+  cudaEventDestroy(d2h_e);
   cgbn_error_report_free(report);
   cudaFree(d);
   return 0;
